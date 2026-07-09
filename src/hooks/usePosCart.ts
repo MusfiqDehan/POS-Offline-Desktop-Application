@@ -11,6 +11,8 @@ import type { CheckoutPayload, PaymentMethod, PosCustomer } from "@/lib/pos-type
 import { apiRowToPosProduct, buildCartLineKey, type PosProduct } from "@/lib/posProductMapping";
 import { extractListItems } from "@/lib/api";
 import { getAccessToken } from "@/lib/auth-session";
+import { resolvePaymentMethodsLoad } from "@/lib/paymentMethodsLoad";
+import { extractReceiptRender } from "@/lib/posReceiptUtils";
 import { getTenantSubdomain } from "@/lib/tenant-headers";
 import { randomUUID } from "@/lib/uuid";
 import { useActiveBranch } from "@/providers/branch-provider";
@@ -33,6 +35,8 @@ export type ReceiptSnapshot = {
   totalPayable: number;
   paymentLabel: string;
   saleId?: string;
+  receipt?: unknown;
+  receiptRender?: string;
 };
 
 export function usePosCart() {
@@ -55,6 +59,13 @@ export function usePosCart() {
       const tenant = getTenantSubdomain();
       const repo = await getPosRepository();
       const token = getAccessToken();
+      const cachedMethods = (await repo.listPaymentMethods(
+        tenant,
+        activeBranch.id,
+      )) as PaymentMethod[];
+
+      let methodsResOk = false;
+      let methodsApiData: unknown;
 
       if (online && token) {
         const [configRes, customersRes, methodsRes] = await Promise.all([
@@ -69,37 +80,53 @@ export function usePosCart() {
           setTaxRate(Number.isNaN(rate) ? 0 : rate);
           setTaxEnabled(cfg.tax_enabled ?? true);
           await repo.savePosConfig(tenant, activeBranch.id, cfg);
+        } else {
+          const cfg = await repo.getPosConfig(tenant, activeBranch.id);
+          if (cfg && typeof cfg === "object") {
+            const c = cfg as { tax_rate?: string; tax_enabled?: boolean };
+            const rate = Number.parseFloat(c.tax_rate ?? "0");
+            setTaxRate(Number.isNaN(rate) ? 0 : rate);
+            setTaxEnabled(c.tax_enabled ?? true);
+          }
         }
 
         if (customersRes.ok && customersRes.body.data) {
           const list = extractListItems<PosCustomer>(customersRes.body.data);
           setCustomers(list);
           await repo.upsertCustomers(tenant, activeBranch.id, list);
+        } else {
+          setCustomers(await repo.listCustomers(tenant, activeBranch.id));
         }
 
-        if (methodsRes.ok && methodsRes.body.data) {
-          const methods = extractListItems<PaymentMethod>(methodsRes.body.data).filter(
-            (m) => m.is_active !== false,
-          );
-          setPaymentMethods(methods);
-          await repo.upsertPaymentMethods(tenant, activeBranch.id, methods);
-          if (methods[0]) setSelectedPaymentId(methods[0].id);
+        methodsResOk = methodsRes.ok;
+        methodsApiData = methodsRes.body.data;
+      } else {
+        setCustomers(await repo.listCustomers(tenant, activeBranch.id));
+        const cfg = await repo.getPosConfig(tenant, activeBranch.id);
+        if (cfg && typeof cfg === "object") {
+          const c = cfg as { tax_rate?: string; tax_enabled?: boolean };
+          const rate = Number.parseFloat(c.tax_rate ?? "0");
+          setTaxRate(Number.isNaN(rate) ? 0 : rate);
+          setTaxEnabled(c.tax_enabled ?? true);
         }
-        return;
       }
 
-      const cust = await repo.listCustomers(tenant, activeBranch.id);
-      setCustomers(cust);
-      const methods = (await repo.listPaymentMethods(tenant, activeBranch.id)) as PaymentMethod[];
-      const activeMethods = methods.filter((m) => m.is_active !== false);
-      setPaymentMethods(activeMethods);
-      if (activeMethods[0]) setSelectedPaymentId(activeMethods[0].id);
-      const cfg = await repo.getPosConfig(tenant, activeBranch.id);
-      if (cfg && typeof cfg === "object") {
-        const c = cfg as { tax_rate?: string; tax_enabled?: boolean };
-        const rate = Number.parseFloat(c.tax_rate ?? "0");
-        setTaxRate(Number.isNaN(rate) ? 0 : rate);
-        setTaxEnabled(c.tax_enabled ?? true);
+      const resolved = resolvePaymentMethodsLoad({
+        online: Boolean(online && token),
+        apiOk: methodsResOk,
+        apiData: methodsApiData,
+        cachedMethods,
+      });
+
+      if (resolved.shouldPersist) {
+        await repo.upsertPaymentMethods(tenant, activeBranch.id, resolved.methods);
+      }
+      setPaymentMethods(resolved.methods);
+      const firstId = resolved.methods[0]?.id;
+      if (firstId) {
+        setSelectedPaymentId((prev) =>
+          prev && resolved.methods.some((m) => m.id === prev) ? prev : firstId,
+        );
       }
     })();
   }, [activeBranch, online]);
@@ -121,10 +148,16 @@ export function usePosCart() {
         return false;
       }
       const stockMax = Number.parseFloat(product.stockLabel) || 999;
+      const existing = items.find((i) => i.id === product.id);
+      if (existing && existing.quantity >= stockMax) {
+        if (!opts?.quiet) showStatus(`${product.name} stock limit reached`);
+        return false;
+      }
+
       setItems((prev) => {
-        const existing = prev.find((i) => i.id === product.id);
-        if (existing) {
-          if (existing.quantity >= stockMax) return prev;
+        const current = prev.find((i) => i.id === product.id);
+        if (current) {
+          if (current.quantity >= stockMax) return prev;
           return prev.map((i) =>
             i.id === product.id ? { ...i, quantity: i.quantity + 1 } : i,
           );
@@ -147,7 +180,7 @@ export function usePosCart() {
       if (!opts?.quiet) showStatus(`Added ${product.name}`);
       return true;
     },
-    [showStatus],
+    [items, showStatus],
   );
 
   const increaseQuantity = useCallback((id: string) => {
@@ -257,6 +290,13 @@ export function usePosCart() {
 
   const completeOrder = useCallback(async () => {
     if (!activeBranch || !selectedPaymentId || items.length === 0) return false;
+
+    // Checkout API validates payments[].method as PaymentMethod.code (e.g. "cash"),
+    // not the row UUID — match web POS usePosCart behavior.
+    const selectedMethod = paymentMethods.find((m) => m.id === selectedPaymentId);
+    const paymentCode = selectedMethod?.code ?? selectedPaymentId;
+    const paymentLabel = selectedMethod?.label ?? "Payment";
+
     const payload: CheckoutPayload = {
       branch: activeBranch.id,
       customer: selectedCustomerId,
@@ -266,15 +306,13 @@ export function usePosCart() {
         variant: i.variantId,
         package: i.packageId,
       })),
-      payments: [{ method: selectedPaymentId, amount: totalPayable.toFixed(2) }],
+      payments: [{ method: paymentCode, amount: totalPayable.toFixed(2) }],
       idempotency_key: randomUUID(),
       promotions: [],
       coupons: [],
       vouchers: [],
     };
 
-    const paymentLabel =
-      paymentMethods.find((m) => m.id === selectedPaymentId)?.label ?? "Payment";
     const invoiceId = `INV-${invoiceSeq}`;
 
     if (online) {
@@ -283,11 +321,14 @@ export function usePosCart() {
         showStatus(res.body.message ?? "Checkout failed");
         return false;
       }
+      const sale = res.body.data;
       setReceiptSnapshot({
-        invoiceId: res.body.data?.ref_number ?? invoiceId,
+        invoiceId: sale?.ref_number ?? invoiceId,
         totalPayable,
         paymentLabel,
-        saleId: res.body.data?.id,
+        saleId: sale?.id,
+        receipt: sale?.receipt,
+        receiptRender: extractReceiptRender(sale?.receipt_render),
       });
     } else {
       await engine.checkoutOffline(activeBranch.id, payload);
@@ -301,9 +342,9 @@ export function usePosCart() {
   }, [
     activeBranch,
     selectedPaymentId,
+    paymentMethods,
     items,
     totalPayable,
-    paymentMethods,
     invoiceSeq,
     online,
     engine,
