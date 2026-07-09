@@ -13,9 +13,28 @@ import { PosTodaySaleModal } from "@/components/pos/PosTodaySaleModal";
 import { usePosCart } from "@/hooks/usePosCart";
 import { usePosCategories } from "@/hooks/usePosCategories";
 import { usePosProducts } from "@/hooks/usePosProducts";
+import { getAccessToken } from "@/lib/auth-session";
+import { fetchPosConfig } from "@/lib/pos-api";
 import { apiRowToPosProduct } from "@/lib/posProductMapping";
+import {
+  playScanSound,
+  scanAddedMessage,
+  scanNotFoundMessage,
+  scanOutOfStockMessage,
+  scanStockLimitMessage,
+} from "@/lib/posScanFeedback";
 import { useActiveBranch } from "@/providers/branch-provider";
 import { useSync } from "@/providers/sync-provider";
+
+function scanFailureMessage(apiMessage: string): string {
+  if (
+    apiMessage === "Select a branch before scanning." ||
+    apiMessage === "Enter a barcode or SKU to scan."
+  ) {
+    return apiMessage;
+  }
+  return scanNotFoundMessage();
+}
 
 export function PosPage() {
   const { activeBranch } = useActiveBranch();
@@ -28,25 +47,66 @@ export function PosPage() {
   const [checkoutOpen, setCheckoutOpen] = useState(false);
   const [receiptOpen, setReceiptOpen] = useState(false);
   const [categoriesOpen, setCategoriesOpen] = useState(false);
+  const [scanSoundEnabled, setScanSoundEnabled] = useState(true);
 
   const cart = usePosCart();
   const categories = usePosCategories(activeTab, setActiveTab);
-  const { products, loading: productsLoading, error: productsError, scanBarcode, reload: reloadProducts } = usePosProducts(
-    activeTab,
-    searchQuery,
-  );
+  const {
+    products,
+    loading: productsLoading,
+    error: productsError,
+    scanBarcode,
+    reload: reloadProducts,
+  } = usePosProducts(activeTab, searchQuery);
+
+  useEffect(() => {
+    if (!activeBranch || !online) return;
+    let cancelled = false;
+    void (async () => {
+      const token = getAccessToken();
+      if (!token) return;
+      const res = await fetchPosConfig(token, activeBranch.id);
+      if (cancelled || !res.ok || !res.body.data) return;
+      setScanSoundEnabled(res.body.data.scan_sound_enabled ?? true);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeBranch, online]);
 
   const handleBarcodeScan = useCallback(
     async (code: string) => {
-      const result = await scanBarcode(code);
-      if (!result.ok) {
-        cart.showStatus(result.message);
-        return;
+      const trimmed = code.trim();
+      if (!trimmed) return;
+
+      try {
+        const result = await scanBarcode(trimmed);
+        if (!result.ok) {
+          if (scanSoundEnabled) playScanSound("error");
+          cart.showStatus(scanFailureMessage(result.message));
+          return;
+        }
+
+        const product = apiRowToPosProduct(result.row);
+        const added = cart.addProduct(product, { quiet: true });
+        if (added) {
+          if (scanSoundEnabled) playScanSound("success");
+          cart.showStatus(scanAddedMessage(product.name));
+          return;
+        }
+
+        if (scanSoundEnabled) playScanSound("error");
+        cart.showStatus(
+          product.stockStatus === "out-of-stock"
+            ? scanOutOfStockMessage(product.name)
+            : scanStockLimitMessage(product.name),
+        );
+      } catch {
+        if (scanSoundEnabled) playScanSound("error");
+        cart.showStatus("Scan failed. Check your connection and try again.");
       }
-      cart.addProduct(apiRowToPosProduct(result.row), { quiet: true });
-      cart.showStatus(`Added ${result.row.name}`);
     },
-    [scanBarcode, cart],
+    [cart, scanBarcode, scanSoundEnabled],
   );
 
   useEffect(() => {
@@ -125,6 +185,7 @@ export function PosPage() {
           onProductSelect={cart.addProduct}
           searchQuery={searchQuery}
           onSearchChange={setSearchQuery}
+          onBarcodeScan={(code) => void handleBarcodeScan(code)}
         />
         <PosOrderDetails
           items={cart.items}
