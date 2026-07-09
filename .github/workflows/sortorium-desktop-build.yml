@@ -1,0 +1,91 @@
+name: Sortorium POS Desktop
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - production
+    paths:
+      - "sortorium-pos-desktop-app/**"
+      - ".github/workflows/sortorium-desktop-build.yml"
+  pull_request:
+    paths:
+      - "sortorium-pos-desktop-app/**"
+      - ".github/workflows/sortorium-desktop-build.yml"
+
+defaults:
+  run:
+    working-directory: sortorium-pos-desktop-app
+
+jobs:
+  build:
+    name: Build (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux
+            platform: ubuntu-22.04
+            args: ""
+            bundles: deb,rpm,appimage
+          - label: windows
+            platform: windows-latest
+            args: ""
+            bundles: nsis
+          - label: macos-arm64
+            platform: macos-latest
+            args: "--target aarch64-apple-darwin"
+            bundles: dmg
+          - label: macos-x64
+            platform: macos-latest
+            args: "--target x86_64-apple-darwin"
+            bundles: dmg
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: matrix.label == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            xdg-utils
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: sortorium-pos-desktop-app/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ startsWith(matrix.label, 'macos') && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: sortorium-pos-desktop-app/src-tauri
+
+      - name: Build installers
+        run: pnpm tauri build -- ${{ matrix.args }} --bundles ${{ matrix.bundles }}
+
+      - name: Upload installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: sortorium-pos-${{ matrix.label }}
+          path: |
+            sortorium-pos-desktop-app/src-tauri/target/release/bundle/**/*
+          if-no-files-found: error
