@@ -1,3 +1,4 @@
+import { DEFAULT_POS_PRODUCT_IMAGE, resolveProductImageUrl } from "@/lib/media";
 import type { PosProductRow } from "@/lib/pos-types";
 
 export type PosProduct = {
@@ -10,6 +11,7 @@ export type PosProduct = {
   price: string;
   stockLabel: string;
   stockStatus: "in-stock" | "low-stock" | "out-of-stock";
+  imageSrc: string;
 };
 
 export function buildCartLineKey(input: {
@@ -40,5 +42,6 @@ export function apiRowToPosProduct(row: PosProductRow): PosProduct {
     price: row.price,
     stockLabel: `${row.available_stock} ${row.unit_name || "pcs"}`,
     stockStatus,
+    imageSrc: resolveProductImageUrl(row.image, DEFAULT_POS_PRODUCT_IMAGE),
   };
 }
