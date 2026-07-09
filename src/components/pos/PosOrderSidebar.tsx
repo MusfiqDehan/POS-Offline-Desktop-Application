@@ -9,7 +9,19 @@ import {
 } from "@/components/ui/select";
 import type { PaymentMethod, PosCustomer } from "@/lib/pos-types";
 import { formatCurrency } from "@/lib/currency";
+import { resolveProductImageUrl } from "@/lib/media";
 import { cn } from "@/lib/utils";
+
+function isResolvableIcon(icon: string | null | undefined): icon is string {
+  if (!icon || !icon.trim()) return false;
+  const trimmed = icon.trim();
+  return (
+    trimmed.startsWith("http://") ||
+    trimmed.startsWith("https://") ||
+    trimmed.startsWith("/media/") ||
+    trimmed.startsWith("/")
+  );
+}
 
 type Props = {
   invoiceId: string;
@@ -122,9 +134,19 @@ export function PosOrderSidebar({
                 key={method.id}
                 type="button"
                 variant={selectedPaymentId === method.id ? "default" : "outline"}
-                className={cn("h-auto py-2", selectedPaymentId === method.id && "bg-primary")}
+                className={cn(
+                  "h-auto gap-2 py-2",
+                  selectedPaymentId === method.id && "bg-primary",
+                )}
                 onClick={() => onSelectPayment(method.id)}
               >
+                {isResolvableIcon(method.icon) && (
+                  <img
+                    src={resolveProductImageUrl(method.icon)}
+                    alt=""
+                    className="h-4 w-4 object-contain"
+                  />
+                )}
                 {method.label}
               </Button>
             ))}
