@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -6,6 +6,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { PosReceiptBody, printReceiptContent } from "@/components/pos/PosReceiptBody";
 import type { ReceiptSnapshot } from "@/hooks/usePosCart";
 import { formatCurrency } from "@/lib/currency";
 
@@ -59,22 +60,37 @@ export function PosReceiptDialog({
   onOpenChange: (open: boolean) => void;
   receipt: ReceiptSnapshot | null;
 }) {
+  const receiptRef = useRef<HTMLDivElement>(null);
+
+  const handlePrint = useCallback(() => {
+    if (receiptRef.current && receipt) {
+      printReceiptContent(receiptRef.current, receipt.invoiceId);
+    }
+  }, [receipt]);
+
   return (
     <Dialog open={open && Boolean(receipt)} onOpenChange={onOpenChange}>
-      <DialogContent>
+      <DialogContent className="max-h-[90vh] max-w-md overflow-y-auto">
         <DialogHeader>
-          <DialogTitle>Sale complete</DialogTitle>
+          <DialogTitle>Receipt</DialogTitle>
         </DialogHeader>
         {receipt && (
-          <div className="space-y-3 text-sm">
-            <p>Invoice: {receipt.invoiceId}</p>
-            <p>Payment: {receipt.paymentLabel}</p>
-            <p className="text-lg font-bold text-primary">
-              Total: {formatCurrency(receipt.totalPayable)}
-            </p>
-            <Button className="w-full" onClick={() => window.print()}>
-              Print receipt
-            </Button>
+          <div className="space-y-3">
+            <div ref={receiptRef}>
+              <PosReceiptBody snapshot={receipt} />
+            </div>
+            <div className="flex gap-2">
+              <Button
+                variant="outline"
+                className="flex-1"
+                onClick={() => onOpenChange(false)}
+              >
+                Close
+              </Button>
+              <Button className="flex-1" onClick={handlePrint}>
+                Print
+              </Button>
+            </div>
           </div>
         )}
       </DialogContent>
