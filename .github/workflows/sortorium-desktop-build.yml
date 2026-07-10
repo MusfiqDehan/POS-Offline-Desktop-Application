@@ -44,8 +44,6 @@ jobs:
   prepare:
     name: Prepare version
     runs-on: ubuntu-24.04
-    # Use the GitHub Environment on real deploys (not PRs) so protection rules apply early.
-    environment: ${{ fromJSON(github.event_name != 'pull_request' && '"production"' || 'null') }}
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
@@ -137,8 +135,10 @@ jobs:
   build:
     name: Build (${{ matrix.label }})
     needs: prepare
-    # Reads VITE_* from the production Environment (Variables / Secrets).
-    environment: ${{ fromJSON(github.event_name != 'pull_request' && '"production"' || 'null') }}
+    # Must be the Environment name exactly — this unlocks Environment secrets/vars.
+    environment: production
+    # Skip Environment-gated production builds on pull requests.
+    if: github.event_name != 'pull_request'
     strategy:
       fail-fast: false
       matrix:
@@ -210,24 +210,34 @@ jobs:
         with:
           workspaces: src-tauri
 
-      # .env is gitignored — Vite bakes VITE_* into the bundle at build time.
-      # For production deploys, set these on the GitHub Environment named "production":
-      #   Settings → Environments → production → Environment variables / secrets
+      # Environment secrets/vars must be named exactly:
+      #   VITE_API_BASE_URL
+      #   VITE_PUBLIC_API_BASE_URL  (optional; falls back to API URL)
+      # Prefer Environment Variables for these — they are public in the built app.
+      # Do not use vars||secrets in one expression; that can blank secret values.
       - name: Write build-time env
         shell: bash
         env:
-          VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL || secrets.VITE_API_BASE_URL }}
-          VITE_PUBLIC_API_BASE_URL: ${{ vars.VITE_PUBLIC_API_BASE_URL || secrets.VITE_PUBLIC_API_BASE_URL || vars.VITE_API_BASE_URL || secrets.VITE_API_BASE_URL }}
+          SECRET_API: ${{ secrets.VITE_API_BASE_URL }}
+          SECRET_PUBLIC: ${{ secrets.VITE_PUBLIC_API_BASE_URL }}
+          VAR_API: ${{ vars.VITE_API_BASE_URL }}
+          VAR_PUBLIC: ${{ vars.VITE_PUBLIC_API_BASE_URL }}
         run: |
-          if [ -z "$VITE_API_BASE_URL" ]; then
-            echo "::error::VITE_API_BASE_URL is not set on the production Environment (or repo Variables/Secrets for PRs)."
+          set -euo pipefail
+          API_URL="${SECRET_API:-${VAR_API:-}}"
+          PUBLIC_URL="${SECRET_PUBLIC:-${VAR_PUBLIC:-${API_URL}}}"
+
+          if [ -z "$API_URL" ]; then
+            echo "::error::VITE_API_BASE_URL is empty. On Environment 'production', add a secret or variable named exactly VITE_API_BASE_URL (case-sensitive)."
+            echo "Checked secrets.VITE_API_BASE_URL length=${#SECRET_API} vars.VITE_API_BASE_URL length=${#VAR_API}"
             exit 1
           fi
+
           {
-            echo "VITE_API_BASE_URL=${VITE_API_BASE_URL}"
-            echo "VITE_PUBLIC_API_BASE_URL=${VITE_PUBLIC_API_BASE_URL}"
+            echo "VITE_API_BASE_URL=${API_URL}"
+            echo "VITE_PUBLIC_API_BASE_URL=${PUBLIC_URL}"
           } > .env
-          echo "Wrote .env for Vite build (API base: ${VITE_API_BASE_URL})"
+          echo "Wrote .env (VITE_API_BASE_URL length=${#API_URL})"
 
       - name: Build installers
         run: pnpm tauri build -- ${{ matrix.args }} --bundles ${{ matrix.bundles }}
@@ -236,6 +246,96 @@ jobs:
         uses: actions/upload-artifact@v7.0.1
         with:
           name: sortorium-pos-${{ matrix.label }}
+          path: |
+            src-tauri/target/release/bundle/**/*
+            src-tauri/target/*/release/bundle/**/*
+          if-no-files-found: error
+
+  # PR builds: no production Environment (no prod secrets). Uses package defaults / optional repo vars.
+  build-pr:
+    name: Build PR (${{ matrix.label }})
+    needs: prepare
+    if: github.event_name == 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux
+            platform: ubuntu-24.04
+            args: ""
+            bundles: deb
+          - label: windows
+            platform: windows-latest
+            args: ""
+            bundles: nsis
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v7.0.0
+
+      - name: Sync app version
+        shell: bash
+        env:
+          APP_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp)"
+          jq --arg v "$APP_VERSION" '.version = $v' package.json > "$tmp" && mv "$tmp" package.json
+          jq --arg v "$APP_VERSION" '.version = $v' src-tauri/tauri.conf.json > "$tmp" && mv "$tmp" src-tauri/tauri.conf.json
+          sed -i.bak -E "s/^version = \".*\"/version = \"${APP_VERSION}\"/" src-tauri/Cargo.toml
+          rm -f src-tauri/Cargo.toml.bak
+
+      - name: Install Linux dependencies
+        if: matrix.label == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            xdg-utils
+
+      - uses: pnpm/action-setup@v6.0.9
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v6.4.0
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: src-tauri
+
+      - name: Write build-time env
+        shell: bash
+        env:
+          VAR_API: ${{ vars.VITE_API_BASE_URL }}
+          VAR_PUBLIC: ${{ vars.VITE_PUBLIC_API_BASE_URL }}
+        run: |
+          API_URL="${VAR_API:-http://localhost:8000/api/v1}"
+          PUBLIC_URL="${VAR_PUBLIC:-$API_URL}"
+          {
+            echo "VITE_API_BASE_URL=${API_URL}"
+            echo "VITE_PUBLIC_API_BASE_URL=${PUBLIC_URL}"
+          } > .env
+
+      - name: Build installers
+        run: pnpm tauri build -- ${{ matrix.args }} --bundles ${{ matrix.bundles }}
+
+      - name: Upload installers
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: sortorium-pos-pr-${{ matrix.label }}
           path: |
             src-tauri/target/release/bundle/**/*
             src-tauri/target/*/release/bundle/**/*
