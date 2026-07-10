@@ -2,31 +2,149 @@ name: Sortorium POS Desktop
 
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Override version (e.g. 0.2.0). Leave empty to auto-bump patch from the latest tag."
+        required: false
+        type: string
+      create_release:
+        description: "Create GitHub tag + release with changelog after a successful build"
+        required: false
+        type: boolean
+        default: true
   push:
     branches:
-      - main
       - production
     paths:
-      - "sortorium-pos-desktop-app/**"
+      - "src/**"
+      - "src-tauri/**"
+      - "public/**"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "vite.config.*"
+      - "tsconfig*.json"
+      - "index.html"
       - ".github/workflows/sortorium-desktop-build.yml"
   pull_request:
     paths:
-      - "sortorium-pos-desktop-app/**"
+      - "src/**"
+      - "src-tauri/**"
+      - "public/**"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "vite.config.*"
+      - "tsconfig*.json"
+      - "index.html"
       - ".github/workflows/sortorium-desktop-build.yml"
 
-defaults:
-  run:
-    working-directory: sortorium-pos-desktop-app
+permissions:
+  contents: write
 
 jobs:
+  prepare:
+    name: Prepare version
+    runs-on: ubuntu-24.04
+    # Use the GitHub Environment on real deploys (not PRs) so protection rules apply early.
+    environment: ${{ fromJSON(github.event_name != 'pull_request' && '"production"' || 'null') }}
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      previous_tag: ${{ steps.version.outputs.previous_tag }}
+      changelog: ${{ steps.version.outputs.changelog }}
+      should_release: ${{ steps.version.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Resolve next version and changelog
+        id: version
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          INPUT_CREATE_RELEASE: ${{ github.event.inputs.create_release }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          previous_tag="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+          if [ -z "$previous_tag" ]; then
+            previous_tag="v$(jq -r .version package.json)"
+            echo "No existing tags; using package.json baseline ${previous_tag}"
+          fi
+
+          if [ -n "${INPUT_VERSION:-}" ]; then
+            version="${INPUT_VERSION#v}"
+          elif [ "$EVENT_NAME" = "pull_request" ]; then
+            version="$(jq -r .version package.json)"
+          else
+            base="${previous_tag#v}"
+            IFS='.' read -r major minor patch <<< "$base"
+            major="${major:-0}"
+            minor="${minor:-0}"
+            patch="${patch:-0}"
+            version="${major}.${minor}.$((patch + 1))"
+          fi
+
+          tag="v${version}"
+
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            should_release="false"
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            if [ "${INPUT_CREATE_RELEASE:-true}" = "true" ]; then
+              should_release="true"
+            else
+              should_release="false"
+            fi
+          elif [ "$EVENT_NAME" = "push" ] && [ "$REF_NAME" = "production" ]; then
+            should_release="true"
+          else
+            should_release="false"
+          fi
+
+          if [ "$should_release" = "true" ] && git rev-parse "$tag" >/dev/null 2>&1; then
+            echo "::error::Tag ${tag} already exists. Bump manually or delete the tag."
+            exit 1
+          fi
+
+          if git rev-parse "$previous_tag" >/dev/null 2>&1; then
+            range="${previous_tag}..HEAD"
+          else
+            range="HEAD"
+          fi
+
+          changelog="$(git log "$range" --pretty=format:'- %s (%h)' --no-merges || true)"
+          if [ -z "$changelog" ]; then
+            changelog="- No commit messages since ${previous_tag}."
+          fi
+
+          {
+            echo "version=${version}"
+            echo "tag=${tag}"
+            echo "previous_tag=${previous_tag}"
+            echo "should_release=${should_release}"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "changelog<<EOF"
+            echo "$changelog"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Resolved version=${version} tag=${tag} previous=${previous_tag} release=${should_release}"
+
   build:
     name: Build (${{ matrix.label }})
+    needs: prepare
+    # Reads VITE_* from the production Environment (Variables / Secrets).
+    environment: ${{ fromJSON(github.event_name != 'pull_request' && '"production"' || 'null') }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - label: linux
-            platform: ubuntu-22.04
+            platform: ubuntu-24.04
             args: ""
             bundles: deb,rpm,appimage
           - label: windows
@@ -45,7 +163,20 @@ jobs:
     runs-on: ${{ matrix.platform }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.0
+
+      - name: Sync app version
+        shell: bash
+        env:
+          APP_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp)"
+          jq --arg v "$APP_VERSION" '.version = $v' package.json > "$tmp" && mv "$tmp" package.json
+          jq --arg v "$APP_VERSION" '.version = $v' src-tauri/tauri.conf.json > "$tmp" && mv "$tmp" src-tauri/tauri.conf.json
+          sed -i.bak -E "s/^version = \".*\"/version = \"${APP_VERSION}\"/" src-tauri/Cargo.toml
+          rm -f src-tauri/Cargo.toml.bak
+          echo "Synced version to ${APP_VERSION}"
 
       - name: Install Linux dependencies
         if: matrix.label == 'linux'
@@ -58,15 +189,15 @@ jobs:
             patchelf \
             xdg-utils
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6.0.9
         with:
           version: 9
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6.4.0
         with:
-          node-version: 22
+          node-version: 24
           cache: pnpm
-          cache-dependency-path: sortorium-pos-desktop-app/pnpm-lock.yaml
+          cache-dependency-path: pnpm-lock.yaml
 
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
@@ -75,17 +206,103 @@ jobs:
         with:
           targets: ${{ startsWith(matrix.label, 'macos') && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
-      - uses: swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.9.1
         with:
-          workspaces: sortorium-pos-desktop-app/src-tauri
+          workspaces: src-tauri
+
+      # .env is gitignored — Vite bakes VITE_* into the bundle at build time.
+      # For production deploys, set these on the GitHub Environment named "production":
+      #   Settings → Environments → production → Environment variables / secrets
+      - name: Write build-time env
+        shell: bash
+        env:
+          VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL || secrets.VITE_API_BASE_URL }}
+          VITE_PUBLIC_API_BASE_URL: ${{ vars.VITE_PUBLIC_API_BASE_URL || secrets.VITE_PUBLIC_API_BASE_URL || vars.VITE_API_BASE_URL || secrets.VITE_API_BASE_URL }}
+        run: |
+          if [ -z "$VITE_API_BASE_URL" ]; then
+            echo "::error::VITE_API_BASE_URL is not set on the production Environment (or repo Variables/Secrets for PRs)."
+            exit 1
+          fi
+          {
+            echo "VITE_API_BASE_URL=${VITE_API_BASE_URL}"
+            echo "VITE_PUBLIC_API_BASE_URL=${VITE_PUBLIC_API_BASE_URL}"
+          } > .env
+          echo "Wrote .env for Vite build (API base: ${VITE_API_BASE_URL})"
 
       - name: Build installers
         run: pnpm tauri build -- ${{ matrix.args }} --bundles ${{ matrix.bundles }}
 
       - name: Upload installers
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: sortorium-pos-${{ matrix.label }}
           path: |
-            sortorium-pos-desktop-app/src-tauri/target/release/bundle/**/*
+            src-tauri/target/release/bundle/**/*
+            src-tauri/target/*/release/bundle/**/*
           if-no-files-found: error
+
+  release:
+    name: Tag and release
+    needs: [prepare, build]
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: ubuntu-24.04
+    environment:
+      name: production
+      url: ${{ format('https://github.com/{0}/releases/tag/{1}', github.repository, needs.prepare.outputs.tag) }}
+    steps:
+      - uses: actions/checkout@v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Download all installers
+        uses: actions/download-artifact@v7.0.0
+        with:
+          path: release-artifacts
+          pattern: sortorium-pos-*
+          merge-multiple: true
+
+      - name: Collect release files
+        id: files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist-release
+          # Prefer installer packages; skip intermediate .app / unpacked dirs noise where possible
+          find release-artifacts -type f \( \
+            -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' \
+            -o -name '*.msi' -o -name '*.exe' -o -name '*.dmg' \
+            -o -name '*.app.tar.gz' \
+          \) -print0 | while IFS= read -r -d '' f; do
+            cp -v "$f" dist-release/
+          done
+          count="$(find dist-release -type f | wc -l | tr -d ' ')"
+          if [ "$count" = "0" ]; then
+            echo "::error::No installer files found to attach to the release."
+            find release-artifacts -type f | head -100
+            exit 1
+          fi
+          echo "Attached ${count} installer file(s)"
+          ls -lah dist-release
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: Sortorium POS ${{ needs.prepare.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          body: |
+            ## Sortorium POS Desktop ${{ needs.prepare.outputs.tag }}
+
+            Changes since `${{ needs.prepare.outputs.previous_tag }}`:
+
+            ${{ needs.prepare.outputs.changelog }}
+
+            ---
+
+            Installers for Linux (`.deb` / `.rpm` / `.AppImage`), Windows (NSIS), and macOS (`.dmg`) are attached below.
+          files: dist-release/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
