@@ -240,7 +240,7 @@ jobs:
           echo "Wrote .env (VITE_API_BASE_URL length=${#API_URL})"
 
       - name: Build installers
-        run: pnpm tauri build -- ${{ matrix.args }} --bundles ${{ matrix.bundles }}
+        run: pnpm tauri build ${{ matrix.args }} --bundles ${{ matrix.bundles }}
 
       - name: Upload installers
         uses: actions/upload-artifact@v7.0.1
@@ -330,7 +330,7 @@ jobs:
           } > .env
 
       - name: Build installers
-        run: pnpm tauri build -- ${{ matrix.args }} --bundles ${{ matrix.bundles }}
+        run: pnpm tauri build ${{ matrix.args }} --bundles ${{ matrix.bundles }}
 
       - name: Upload installers
         uses: actions/upload-artifact@v7.0.1
