@@ -1,6 +1,6 @@
 # Sortorium POS Desktop
 
-Offline-capable Tauri 2 + React POS client for tenant cashiers.
+Offline-capable Tauri 2 + React POS client for tenant cashiers or permitted users
 
 ## Stack
 
